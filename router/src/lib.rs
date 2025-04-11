@@ -538,6 +538,15 @@ pub struct ErrorResponse {
     pub error_type: ErrorType,
 }
 
+impl From<arrow::error::ArrowError> for ErrorResponse {
+    fn from(err: arrow::error::ArrowError) -> Self {
+        ErrorResponse {
+            error: err.to_string(),
+            error_type: ErrorType::Backend,
+        }
+    }
+}
+
 impl From<TextEmbeddingsError> for ErrorResponse {
     fn from(err: TextEmbeddingsError) -> Self {
         let error_type = match err {

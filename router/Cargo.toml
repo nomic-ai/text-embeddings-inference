@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+arrow = "54.3.1"
 text-embeddings-backend = { path = "../backends", features = ["clap"] }
 text-embeddings-core = { path = "../core" }
 clap = { workspace = true }

@@ -25,10 +25,11 @@ use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use futures::future::join_all;
 use futures::FutureExt;
-use http::header::AUTHORIZATION;
+use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use simsimd::SpatialSimilarity;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use text_embeddings_backend::BackendError;
 use text_embeddings_core::infer::{
@@ -556,6 +557,215 @@ async fn similarity(
         .collect();
 
     Ok((header_map, Json(SimilarityResponse(distances))))
+}
+
+/// Get Embeddings. Returns a 424 status code if the model is not an embedding model.
+#[utoipa::path(
+    post,
+    tag = "Text Embeddings Inference",
+    path = "/embed_arrow",
+    request_body = EmbedRequest,
+    responses(
+    (status = 200, description = "Embeddings", content_type = "application/vnd.apache.arrow.file"),
+    (status = 424, description = "Embedding Error", body = ErrorResponse,
+    example = json ! ({"error": "Inference failed", "error_type": "backend"})),
+    (status = 429, description = "Model is overloaded", body = ErrorResponse,
+    example = json ! ({"error": "Model is overloaded", "error_type": "overloaded"})),
+    (status = 422, description = "Tokenization error", body = ErrorResponse,
+    example = json ! ({"error": "Tokenization error", "error_type": "tokenizer"})),
+    (status = 400, description = "Batch is empty", body = ErrorResponse,
+    example = json ! ({"error": "Batch is empty", "error_type": "empty"})),
+    (status = 413, description = "Batch size error", body = ErrorResponse,
+    example = json ! ({"error": "Batch size error", "error_type": "validation"})),
+    )
+    )]
+#[instrument(
+    skip_all,
+    fields(total_time, tokenization_time, queue_time, inference_time,)
+)]
+async fn embed_arrow(
+    infer: Extension<Infer>,
+    info: Extension<Info>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
+    let span = tracing::Span::current();
+    let start_time = Instant::now();
+
+    let truncate = req.truncate.unwrap_or(info.auto_truncate);
+
+    let (response, metadata) = match req.inputs {
+        Input::Single(input) => {
+            metrics::counter!("te_request_count", "method" => "single").increment(1);
+
+            let compute_chars = input.count_chars();
+
+            let permit = infer.try_acquire_permit().map_err(ErrorResponse::from)?;
+            let response = infer
+                .embed_pooled(
+                    input,
+                    truncate,
+                    req.truncation_direction.into(),
+                    req.prompt_name,
+                    req.normalize,
+                    permit,
+                )
+                .await
+                .map_err(ErrorResponse::from)?;
+
+            metrics::counter!("te_request_success", "method" => "single").increment(1);
+
+            (
+                EmbedResponse(vec![response.results]),
+                ResponseMetadata::new(
+                    compute_chars,
+                    response.metadata.prompt_tokens,
+                    start_time,
+                    response.metadata.tokenization,
+                    response.metadata.queue,
+                    response.metadata.inference,
+                ),
+            )
+        }
+        Input::Batch(inputs) => {
+            let counter = metrics::counter!("te_request_count", "method" => "batch");
+            counter.increment(1);
+
+            if inputs.is_empty() {
+                let message = "`inputs` cannot be empty".to_string();
+                tracing::error!("{message}");
+                let err = ErrorResponse {
+                    error: message,
+                    error_type: ErrorType::Empty,
+                };
+                let counter = metrics::counter!("te_request_failure", "err" => "validation");
+                counter.increment(1);
+                Err(err)?;
+            }
+
+            let batch_size = inputs.len();
+            if batch_size > info.max_client_batch_size {
+                let message = format!(
+                    "batch size {batch_size} > maximum allowed batch size {}",
+                    info.max_client_batch_size
+                );
+                tracing::error!("{message}");
+                let err = ErrorResponse {
+                    error: message,
+                    error_type: ErrorType::Validation,
+                };
+                let counter = metrics::counter!("te_request_failure", "err" => "batch_size");
+                counter.increment(1);
+                Err(err)?;
+            }
+
+            let mut futures = Vec::with_capacity(batch_size);
+            let mut compute_chars = 0;
+
+            for input in inputs {
+                compute_chars += input.count_chars();
+
+                let local_infer = infer.clone();
+                let prompt_name = req.prompt_name.clone();
+                futures.push(async move {
+                    let permit = local_infer.acquire_permit().await;
+                    local_infer
+                        .embed_pooled(
+                            input,
+                            truncate,
+                            req.truncation_direction.into(),
+                            prompt_name,
+                            req.normalize,
+                            permit,
+                        )
+                        .await
+                })
+            }
+            let results = join_all(futures)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<PooledEmbeddingsInferResponse>, TextEmbeddingsError>>()
+                .map_err(ErrorResponse::from)?;
+
+            let mut embeddings = Vec::with_capacity(batch_size);
+            let mut total_tokenization_time = 0;
+            let mut total_queue_time = 0;
+            let mut total_inference_time = 0;
+            let mut total_compute_tokens = 0;
+
+            for r in results {
+                total_tokenization_time += r.metadata.tokenization.as_nanos() as u64;
+                total_queue_time += r.metadata.queue.as_nanos() as u64;
+                total_inference_time += r.metadata.inference.as_nanos() as u64;
+                total_compute_tokens += r.metadata.prompt_tokens;
+                embeddings.push(r.results);
+            }
+            let batch_size = batch_size as u64;
+
+            let counter = metrics::counter!("te_request_success", "method" => "batch");
+            counter.increment(1);
+
+            (
+                EmbedResponse(embeddings),
+                ResponseMetadata::new(
+                    compute_chars,
+                    total_compute_tokens,
+                    start_time,
+                    Duration::from_nanos(total_tokenization_time / batch_size),
+                    Duration::from_nanos(total_queue_time / batch_size),
+                    Duration::from_nanos(total_inference_time / batch_size),
+                ),
+            )
+        }
+    };
+
+    let emb_dim = response.0[0].len();
+    let mut fslb = arrow::array::FixedSizeListBuilder::new(
+        arrow::array::Float32Builder::new(),
+        emb_dim as i32,
+    );
+    for emb in response.0.iter() {
+        fslb.values().append_slice(emb);
+        fslb.append(true);
+    }
+    let fsl = fslb.finish();
+
+    let mut ipc_out: Vec<u8> = Vec::new();
+    let batch = arrow::array::RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(
+                "embedding",
+                arrow::datatypes::DataType::FixedSizeList(
+                    Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        arrow::datatypes::DataType::Float32,
+                        true,
+                    )),
+                    emb_dim as i32,
+                ),
+                false,
+            ),
+        ])),
+        vec![Arc::new(fsl)],
+    )
+    .map_err(ErrorResponse::from)?;
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut ipc_out, &batch.schema())
+        .map_err(ErrorResponse::from)?;
+
+    writer.write(&batch).map_err(ErrorResponse::from)?;
+    writer.finish().map_err(ErrorResponse::from)?;
+
+    metadata.record_span(&span);
+    metadata.record_metrics();
+
+    let mut headers = HeaderMap::from(metadata);
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.apache.arrow.file"),
+    );
+
+    tracing::info!("Success");
+
+    Ok((headers, ipc_out))
 }
 
 /// Get Embeddings. Returns a 424 status code if the model is not an embedding model.
@@ -1729,6 +1939,7 @@ pub async fn run(
         // Base routes
         .route("/info", get(get_model_info))
         .route("/embed", post(embed))
+        .route("/embed_arrow", post(embed_arrow))
         .route("/embed_all", post(embed_all))
         .route("/embed_sparse", post(embed_sparse))
         .route("/predict", post(predict))
