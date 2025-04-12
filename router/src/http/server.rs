@@ -593,7 +593,7 @@ async fn embed_arrow(
 
     let truncate = req.truncate.unwrap_or(info.auto_truncate);
 
-    let (response, metadata) = match req.inputs {
+    let (fsl, metadata) = match req.inputs {
         Input::Single(input) => {
             metrics::counter!("te_request_count", "method" => "single").increment(1);
 
@@ -614,8 +614,17 @@ async fn embed_arrow(
 
             metrics::counter!("te_request_success", "method" => "single").increment(1);
 
+            let emb_dim = response.results.len();
+            let mut fslb = arrow::array::FixedSizeListBuilder::new(
+                arrow::array::Float32Builder::new(),
+                emb_dim as i32,
+            );
+            fslb.values().append_slice(&response.results);
+            fslb.append(true);
+
+            let fsl = fslb.finish();
             (
-                EmbedResponse(vec![response.results]),
+                fsl,
                 ResponseMetadata::new(
                     compute_chars,
                     response.metadata.prompt_tokens,
@@ -686,26 +695,32 @@ async fn embed_arrow(
                 .collect::<Result<Vec<PooledEmbeddingsInferResponse>, TextEmbeddingsError>>()
                 .map_err(ErrorResponse::from)?;
 
-            let mut embeddings = Vec::with_capacity(batch_size);
             let mut total_tokenization_time = 0;
             let mut total_queue_time = 0;
             let mut total_inference_time = 0;
             let mut total_compute_tokens = 0;
 
+            let emb_dim = results[0].results.len();
+            let mut fslb = arrow::array::FixedSizeListBuilder::new(
+                arrow::array::Float32Builder::new(),
+                emb_dim as i32,
+            );
             for r in results {
                 total_tokenization_time += r.metadata.tokenization.as_nanos() as u64;
                 total_queue_time += r.metadata.queue.as_nanos() as u64;
                 total_inference_time += r.metadata.inference.as_nanos() as u64;
                 total_compute_tokens += r.metadata.prompt_tokens;
-                embeddings.push(r.results);
+                fslb.values().append_slice(&r.results);
+                fslb.append(true);
             }
             let batch_size = batch_size as u64;
 
             let counter = metrics::counter!("te_request_success", "method" => "batch");
             counter.increment(1);
 
+            let fsl = fslb.finish();
             (
-                EmbedResponse(embeddings),
+                fsl,
                 ResponseMetadata::new(
                     compute_chars,
                     total_compute_tokens,
@@ -718,17 +733,6 @@ async fn embed_arrow(
         }
     };
 
-    let emb_dim = response.0[0].len();
-    let mut fslb = arrow::array::FixedSizeListBuilder::new(
-        arrow::array::Float32Builder::new(),
-        emb_dim as i32,
-    );
-    for emb in response.0.iter() {
-        fslb.values().append_slice(emb);
-        fslb.append(true);
-    }
-    let fsl = fslb.finish();
-
     let mut ipc_out: Vec<u8> = Vec::new();
     let batch = arrow::array::RecordBatch::try_new(
         Arc::new(arrow::datatypes::Schema::new(vec![
@@ -740,7 +744,7 @@ async fn embed_arrow(
                         arrow::datatypes::DataType::Float32,
                         true,
                     )),
-                    emb_dim as i32,
+                    fsl.value_length() as i32,
                 ),
                 false,
             ),
