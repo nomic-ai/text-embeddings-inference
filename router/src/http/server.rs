@@ -28,6 +28,7 @@ use futures::FutureExt;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use simsimd::SpatialSimilarity;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -734,24 +735,26 @@ async fn embed_arrow(
     };
 
     let mut ipc_out: Vec<u8> = Vec::new();
-    let batch = arrow::array::RecordBatch::try_new(
-        Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new(
-                "embedding",
-                arrow::datatypes::DataType::FixedSizeList(
-                    Arc::new(arrow::datatypes::Field::new(
-                        "item",
-                        arrow::datatypes::DataType::Float32,
-                        true,
-                    )),
-                    fsl.value_length() as i32,
-                ),
-                false,
+    let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        vec![arrow::datatypes::Field::new(
+            "embedding",
+            arrow::datatypes::DataType::FixedSizeList(
+                Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    arrow::datatypes::DataType::Float32,
+                    true,
+                )),
+                fsl.value_length() as i32,
             ),
-        ])),
-        vec![Arc::new(fsl)],
-    )
-    .map_err(ErrorResponse::from)?;
+            false,
+        )],
+        HashMap::from([(
+            "compute_tokens".to_string(),
+            metadata.compute_tokens.to_string(),
+        )]),
+    ));
+    let batch = arrow::array::RecordBatch::try_new(schema, vec![Arc::new(fsl)])
+        .map_err(ErrorResponse::from)?;
     let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut ipc_out, &batch.schema())
         .map_err(ErrorResponse::from)?;
 
