@@ -30,7 +30,7 @@ opentelemetry-semantic-conventions==0.36b0 ; python_version >= "3.9" and python_
 packaging==23.1 ; python_version >= "3.9" and python_version < "3.13"
 protobuf==4.24.3 ; python_version >= "3.9" and python_version < "3.13"
 pyyaml==6.0.1 ; python_version >= "3.9" and python_version < "3.13"
-requests==2.31.0 ; python_version >= "3.9" and python_version < "3.13"
+requests==2.32.4 ; python_version >= "3.9" and python_version < "3.13"
 safetensors==0.4.1 ; python_version >= "3.9" and python_version < "3.13"
 setuptools==68.2.0 ; python_version >= "3.9" and python_version < "3.13"
 sympy==1.12 ; python_version >= "3.9" and python_version < "3.13"
