@@ -52,7 +52,7 @@ transformers[sentencepiece]==4.45.2 ; python_version >= "3.9" and python_version
 typer==0.6.1 ; python_version >= "3.9" and python_version < "3.13"
 typing-extensions==4.8.0 ; python_version >= "3.9" and python_version < "3.13"
 tzdata==2024.1 ; python_version >= "3.9" and python_version < "3.13"
-urllib3==2.0.4 ; python_version >= "3.9" and python_version < "3.13"
+urllib3==2.5.0 ; python_version >= "3.9" and python_version < "3.13"
 win32-setctime==1.1.0 ; python_version >= "3.9" and python_version < "3.13" and sys_platform == "win32"
 wrapt==1.15.0 ; python_version >= "3.9" and python_version < "3.13"
 xxhash==3.4.1 ; python_version >= "3.9" and python_version < "3.13"
