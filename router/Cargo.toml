@@ -38,7 +38,7 @@ tokenizers = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = "0.24.0"
-tracing-subscriber = { version = "0.3.16", features = ["json", "env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["json", "env-filter"] }
 veil = "0.1.6"
 
 # HTTP dependencies
